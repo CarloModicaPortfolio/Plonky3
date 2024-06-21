@@ -28,4 +28,5 @@ members = [
     "symmetric",
     "util",
     "uni-stark",
+    "pasta",
 ]
