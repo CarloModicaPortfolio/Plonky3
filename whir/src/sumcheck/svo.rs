@@ -479,6 +479,14 @@ impl<F: Field, EF: ExtensionField<F>> SvoPoint<F, EF> {
         // Materializes the contribution of this split eq into the output buffer.
         self.split_eq.accumulate_into_packed(out, Some(scale));
     }
+
+    /// Like `accumulate_into_packed` but OVERWRITES `out` instead of `+=`. Used by
+    /// `combine_into_packed` on the first claim to skip the implicit zero-init cost
+    /// of a freshly `Poly::zero`-allocated output buffer.
+    fn store_into_packed(&self, out: &mut [EF::ExtensionPacking], rs: &Point<EF>, alpha: EF) {
+        let scale = Poly::new_from_point(self.z_svo.as_slice(), alpha).eval_ext::<F>(rs);
+        self.split_eq.store_into_packed(out, Some(scale));
+    }
 }
 
 /// Split equality polynomial with precomputed accumulators for optimized sumcheck proving.
@@ -674,8 +682,15 @@ impl<F: Field, EF: ExtensionField<F>> SvoClaim<F, EF> {
             "combine_into_packed: wrong number of SVO challenges"
         );
 
-        // Accumulate each split eq into the output, weighted by powers of alpha.
-        for (svo_claim, alpha) in selfs.iter().zip(alpha.powers()) {
+        // First claim OVERWRITES `out`; subsequent claims ACCUMULATE. This skips the
+        // implicit page-fault read cost of `+=` on the freshly `Poly::zero`-allocated
+        // buffer. Measured ~10% end-to-end speedup on SVO large (22 vars, BabyBear
+        // Ext4, AVX-512).
+        let mut iter = selfs.iter().zip(alpha.powers());
+        if let Some((first_claim, first_alpha)) = iter.next() {
+            first_claim.point.store_into_packed(out, rs, first_alpha);
+        }
+        for (svo_claim, alpha) in iter {
             svo_claim.point.accumulate_into_packed(out, rs, alpha);
         }
     }
