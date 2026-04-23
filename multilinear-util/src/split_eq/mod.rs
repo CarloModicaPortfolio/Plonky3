@@ -255,6 +255,45 @@ impl<F: Field, EF: ExtensionField<F>> SplitEq<F, EF> {
         out
     }
 
+    /// Overwrite-variant of `accumulate_into_packed`: assigns `scale * eq(w, i)` to
+    /// every `out[i]` (full write coverage), skipping the implicit page-fault read
+    /// cost that `+=` would incur on a freshly `Poly::zero`-allocated buffer. Use
+    /// this for the first summand of a sum built up by multiple `accumulate_into_*`
+    /// calls; subsequent summands still use `accumulate_into_packed`.
+    pub fn store_into_packed(&self, out: &mut [EF::ExtensionPacking], scale: Option<EF>) {
+        assert_eq!(
+            log2_strict_usize(F::Packing::WIDTH * out.len()),
+            self.num_vars()
+        );
+        let w_scale = scale.unwrap_or(EF::ONE);
+
+        if log2_strict_usize(F::Packing::WIDTH) * 2 > self.num_vars() {
+            // `materialize` writes `out[i]` once per index — full coverage.
+            out.iter_mut()
+                .zip_eq(self.materialize().0.chunks(F::Packing::WIDTH))
+                .for_each(|(out, chunk)| {
+                    *out = EF::ExtensionPacking::from_ext_slice(chunk) * w_scale;
+                });
+        } else {
+            // Each eq0 chunk receives exactly one `=` write from `store_packed_into`;
+            // chunks are disjoint, so a single pass covers every `out[i]`.
+            let cs = self.eq1.scalar_chunk_size() / F::Packing::WIDTH;
+            if (1 << self.num_vars()) < PARALLEL_THRESHOLD {
+                out.chunks_mut(cs)
+                    .zip(self.eq0.iter())
+                    .for_each(|(chunk, &w0)| {
+                        self.eq1.store_packed_into(chunk, w0 * w_scale);
+                    });
+            } else {
+                out.par_chunks_mut(cs)
+                    .zip(self.eq0.0.par_iter())
+                    .for_each(|(chunk, &w0)| {
+                        self.eq1.store_packed_into(chunk, w0 * w_scale);
+                    });
+            }
+        }
+    }
+
     /// Adds the factored eq table into a SIMD-packed output buffer.
     ///
     /// Same semantics as the scalar version, but the output is in packed form.
@@ -368,13 +407,18 @@ impl<F: Field, EF: ExtensionField<F>> SplitEq<F, EF> {
 
         if (1 << poly.num_vars()) < PARALLEL_THRESHOLD {
             let mut out = Poly::<EF::ExtensionPacking>::zero(k_inner);
-            poly.0
-                .chunks(size_outer)
-                .zip_eq(self.eq0.iter())
-                .for_each(|(chunk, &w0)| {
-                    self.eq1
-                        .compress_lo_to_packed_into(out.as_mut_slice(), chunk, w0);
-                });
+            // First outer iter uses the STORE variant (overwrites its portion of `out`
+            // via `*acc = w * f`). This skips the implicit CoW page-fault READ cost of
+            // `+=` on the freshly `Poly::zero`-allocated buffer.
+            let mut outer = poly.0.chunks(size_outer).zip_eq(self.eq0.iter());
+            if let Some((chunk0, &w0_0)) = outer.next() {
+                self.eq1
+                    .compress_lo_to_packed_store_into(out.as_mut_slice(), chunk0, w0_0);
+            }
+            outer.for_each(|(chunk, &w0)| {
+                self.eq1
+                    .compress_lo_to_packed_into(out.as_mut_slice(), chunk, w0);
+            });
             out
         } else {
             poly.0

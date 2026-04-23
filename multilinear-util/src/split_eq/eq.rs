@@ -205,6 +205,20 @@ impl<F: Field, EF: ExtensionField<F>> EqMaybePacked<F, EF> {
         }
     }
 
+    /// Like `accumulate_packed_into` but OVERWRITES `out` with `weight * eq1[i]` instead
+    /// of accumulating. Intended for the first write into a freshly-allocated zero buffer
+    /// to avoid paying the implicit page-fault read cost that `+=` would incur.
+    pub fn store_packed_into(&self, out: &mut [EF::ExtensionPacking], weight: EF) {
+        match self {
+            Self::Packed(eq1) => {
+                out.iter_mut()
+                    .zip(eq1.iter())
+                    .for_each(|(out, &w1)| *out = w1 * weight);
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Weighted accumulation for low-variable compression.
     ///
     /// For each eq1 entry, accumulates w0 * eq1[i] * chunk_row[j] into out[j].
@@ -274,23 +288,51 @@ impl<F: Field, EF: ExtensionField<F>> EqMaybePacked<F, EF> {
         chunk: &[F],
         w0: EF,
     ) {
+        self.compress_lo_to_packed_into_impl(out, chunk, w0, false);
+    }
+
+    /// STORE-FIRST variant: overwrites `out` with the first eq1 iteration's
+    /// contribution, then accumulates for subsequent iterations. Only safe on a
+    /// freshly-allocated `out`; avoids the CoW page-fault READ cost of a first `+=`.
+    pub(super) fn compress_lo_to_packed_store_into(
+        &self,
+        out: &mut [EF::ExtensionPacking],
+        chunk: &[F],
+        w0: EF,
+    ) {
+        self.compress_lo_to_packed_into_impl(out, chunk, w0, true);
+    }
+
+    #[inline(always)]
+    fn compress_lo_to_packed_into_impl(
+        &self,
+        out: &mut [EF::ExtensionPacking],
+        chunk: &[F],
+        w0: EF,
+        first_stores: bool,
+    ) {
         match self {
             Self::Unpacked(eq1) => {
                 let packed_inner = out.len();
                 // Pack the entire scalar chunk into SIMD elements.
                 let chunk = F::Packing::pack_slice(chunk);
-                // Iterate over eq1 entries; each owns packed_inner packed elements.
-                chunk
-                    .chunks(packed_inner)
-                    .zip_eq(eq1.iter())
-                    .for_each(|(chunk, &w1)| {
-                        // Broadcast the combined weight into packed form.
-                        let w = EF::ExtensionPacking::from(w0 * w1);
-                        // Accumulate packed weighted values.
-                        out.iter_mut()
-                            .zip_eq(chunk.iter())
-                            .for_each(|(acc, &f)| *acc += w * f);
-                    });
+                let mut it = chunk.chunks(packed_inner).zip_eq(eq1.iter());
+                if first_stores
+                    && let Some((chunk0, &w1_0)) = it.next()
+                {
+                    let w = EF::ExtensionPacking::from(w0 * w1_0);
+                    out.iter_mut()
+                        .zip_eq(chunk0.iter())
+                        .for_each(|(acc, &f)| *acc = w * f);
+                }
+                it.for_each(|(chunk, &w1)| {
+                    // Broadcast the combined weight into packed form.
+                    let w = EF::ExtensionPacking::from(w0 * w1);
+                    // Accumulate packed weighted values.
+                    out.iter_mut()
+                        .zip_eq(chunk.iter())
+                        .for_each(|(acc, &f)| *acc += w * f);
+                });
             }
             Self::Packed(eq1) => {
                 // Inner size in scalar terms: out.len() packed elements * W scalars each.
