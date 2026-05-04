@@ -42,11 +42,17 @@
 //!    (preserving the dependency isolation set up in #1601).
 //!
 //! 4. **Wire format — skip the linear coefficient.** Per round, send
-//!    `(c0, c2, c3, …, c_{ℓ_zk-1})`; verifier derives `c1` from the affine
-//!    consistency check `ĥ_j(0) + ĥ_j(1) = ε·μ + μ̃` (round 1) or
-//!    `= ĥ_{j-1}(γ_{j-1})` (subsequent rounds). Matches Lemma 6.4's affine
-//!    subspace dimension `1 + k·(ℓ_zk - 1)` and mirrors the existing
-//!    plain-path convention in [`super::single`].
+//!    `max(ℓ_zk - 1, 2)` field elements: `(c0, c2, c3, …, c_{max(ℓ_zk, 3)-1})`.
+//!    The verifier derives `c1` from the affine consistency check
+//!    `ĥ_j(0) + ĥ_j(1) = ε·μ + μ̃` (round 1) or `= ĥ_{j-1}(γ_{j-1})`
+//!    (subsequent rounds). Combined polynomial degree is
+//!    `max(ℓ_zk - 1, 2)`: mask piece is degree `ℓ_zk - 1`, plain piece in
+//!    WHIR is quadratic (multilinear × multilinear). For `ℓ_zk ≥ 3` this
+//!    matches Lemma 6.4's affine-subspace dim `1 + k(ℓ_zk - 1)`; for
+//!    `ℓ_zk = 2` we use `1 + k·max(ℓ_zk - 1, 2)`, patching a small paper
+//!    inconsistency (Construction 6.3 step 4(a)'s `< max{2, ℓ_zk}` bound
+//!    undercounts at `ℓ_zk = 2`). Mirrors the existing plain-path's
+//!    "skip linear coefficient" convention in [`super::single`].
 //!
 //! 5. **Field constraints** — `char(F) ≠ 2` (Lemma 6.4 rank-nullity argument)
 //!    and `ℓ_zk ≥ 2`. Enforced via runtime `assert!` in the constructor for
@@ -101,6 +107,7 @@
 //! - Depends on: #1584/#1601 (ZK encoding traits in `p3-zk-codes`).
 //! - Tracked under: #1590 (HVZK-WHIR effort).
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
@@ -114,8 +121,29 @@ use rand::distr::{Distribution, StandardUniform};
 use rand::{Rng, RngExt};
 
 use crate::constraints::statement::EqStatement;
-use crate::sumcheck::SumcheckData;
-use crate::sumcheck::strategy::SumcheckProver;
+use crate::sumcheck::extrapolate_01inf;
+use crate::sumcheck::product_polynomial::ProductPolynomial;
+use crate::sumcheck::strategy::{SumcheckProver, VariableOrder};
+
+/// Per-round transcript records for the HVZK sumcheck.
+///
+/// Mirrors [`super::data::SumcheckData`] but stores variable-length per-round
+/// wire payloads. Plain WHIR's per-round polynomial is always degree 2 so its
+/// wire format fits in a fixed `[EF; 2]`; the HVZK variant's per-round
+/// polynomial has degree `max(ℓ_zk - 1, 2)` (mask piece + ε·plain piece), so
+/// each round carries `max(ℓ_zk - 1, 2)` field elements after skipping the
+/// linear coefficient. The length is constant for any single proof but only
+/// known at runtime (= `encoding.message_len()`-derived), so we use
+/// `Vec<Vec<EF>>` rather than a const-generic array.
+#[derive(Default, Debug, Clone)]
+pub struct ZkSumcheckData<F, EF> {
+    /// Per-round wire-format coefficients of `ĥ_j`, with `c_1` skipped
+    /// (verifier derives it from the affine consistency check).
+    /// Layout per entry: `[c0, c2, c3, …, c_{combined_degree}]`.
+    pub round_coefficients: Vec<Vec<EF>>,
+    /// Per-round PoW witnesses (one entry per round if `pow_bits > 0`).
+    pub pow_witnesses: Vec<F>,
+}
 
 /// Namespace for the HVZK variant of the WHIR sumcheck.
 ///
@@ -211,7 +239,7 @@ impl ZkSumcheck {
     #[allow(clippy::too_many_arguments)]
     pub fn new_classic_unpacked<F, EF, Enc, M, Challenger, R>(
         poly: &Poly<F>,
-        sumcheck_data: &mut SumcheckData<F, EF>,
+        zk_data: &mut ZkSumcheckData<F, EF>,
         challenger: &mut Challenger,
         folding_factor: usize,
         pow_bits: usize,
@@ -223,7 +251,7 @@ impl ZkSumcheck {
     where
         F: Field,
         EF: ExtensionField<F>,
-        Enc: ZkEncoding<F>,
+        Enc: ZkEncoding<F> + Clone,
         Enc::Codeword: Matrix<F>,
         M: Mmcs<F>,
         Challenger:
@@ -233,6 +261,7 @@ impl ZkSumcheck {
     {
         let k = folding_factor;
         let ell_zk = encoding.message_len();
+        let n_vars = poly.num_variables();
 
         // ----- Field constraints (decision block item 5) -----
         assert!(
@@ -244,6 +273,22 @@ impl ZkSumcheck {
             "Construction 6.3 (Lemma 6.4) requires ell_zk >= 2",
         );
         assert!(k >= 1, "sumcheck requires at least one round");
+        assert!(
+            k <= n_vars,
+            "folding_factor must be <= poly.num_variables()",
+        );
+
+        // ----- Constraint batching (Plonky3-specific; not in Construction 6.3) -----
+        // Mirrors plain WHIR's `SingleSumcheck::new_classic_unpacked`: sample
+        // `alpha` first to combine multiple `EqStatement` constraints into a
+        // single weight polynomial via random linear combination. The paper
+        // assumes single-claim input (relation `R_{C, C_zk, sl}` from
+        // [Definition 5.8]), so it doesn't address this; for Plonky3 we have
+        // to collapse here before proceeding with Construction 6.3's flow.
+        let alpha: EF = challenger.sample_algebra_element();
+        let mut weights = Poly::zero(n_vars);
+        let mut sum = EF::ZERO;
+        statement.combine_hypercube::<F, false>(&mut weights, &mut sum, alpha);
 
         // ----- Step 1 — sample k masks `s_1, …, s_k ∈ F^{<ell_zk}[X]` -----
         // Each mask is a coefficient vector of length `ell_zk` over F.
@@ -315,32 +360,111 @@ impl ZkSumcheck {
         challenger.observe_algebra_element(EF::from(mu_tilde));
 
         // ----- Step 3 — sample ε from the challenger -----
-        let _eps: EF = challenger.sample_algebra_element();
+        let eps: EF = challenger.sample_algebra_element();
 
-        // Suppress unused-binding warnings for state we'll wire up in
-        // commit 3; keeping them in scope so the call sites are visible.
-        let _ = (
-            poly,
-            sumcheck_data,
-            pow_bits,
-            statement,
-            masks,
-            mask_oracles,
-            sum_future_endpoints,
+        // ===== Step 4, round 1: build and observe `ĥ_1`, fold base. =====
+
+        // Option B start-of-round decrement (decision block item 6 / module
+        // docs): subtract `s_1`'s endpoints so `sum_future_endpoints_state`
+        // now equals `Σ_{l > 1} (s_l(0) + s_l(1))`, matching the value the
+        // per-round formula expects for `j = 1`.
+        let s_1_endpoints = masks[0][0] + masks[0].iter().copied().sum::<F>();
+        let sum_future_endpoints_state = sum_future_endpoints - s_1_endpoints;
+
+        // Plain piece via the existing single-sumcheck helper. Returns
+        // `(c0, c_inf)` for a degree-2 polynomial; `c1` is derived from the
+        // affine sum constraint `h(0) + h(1) = sum`, giving
+        // `c1 = sum - 2·c0 - c_inf`.
+        let (plain_c0, plain_c_inf) =
+            VariableOrder::Prefix.sumcheck_coefficients(poly.as_slice(), weights.as_slice());
+        let plain_c1 = sum - plain_c0.double() - plain_c_inf;
+
+        // Build `ĥ_1` coefficient vector of length `max(ell_zk, 3)`.
+        // Indices `0..ell_zk` get the mask contribution; indices `0..3` get
+        // `ε · plain_piece`; the constant term also picks up
+        // `2^{k-2} · sum_future_endpoints_state` for the future-mask
+        // contribution (only when `k ≥ 2`; for `k = 1` there are no
+        // future masks and the coefficient `2^{k-2}` is unused).
+        let h1_size = core::cmp::max(ell_zk, 3);
+        let mut h1: Vec<EF> = vec![EF::ZERO; h1_size];
+
+        let two_pow_k_minus_1 = F::TWO.exp_u64((k - 1) as u64);
+        for (i, &c) in masks[0].iter().enumerate() {
+            h1[i] += EF::from(two_pow_k_minus_1 * c);
+        }
+        if k >= 2 {
+            let two_pow_k_minus_2 = F::TWO.exp_u64((k - 2) as u64);
+            h1[0] += EF::from(two_pow_k_minus_2 * sum_future_endpoints_state);
+        }
+
+        h1[0] += eps * plain_c0;
+        h1[1] += eps * plain_c1;
+        h1[2] += eps * plain_c_inf;
+
+        // Sanity check the affine constraint:
+        //   h(0) + h(1) = c0 + (c0 + c1 + c2 + … + c_d) = 2·c0 + Σ_{i≥1} c_i.
+        // Must equal `μ̃ + ε·μ` by the protocol.
+        debug_assert_eq!(
+            h1[0].double() + h1[1..].iter().copied().sum::<EF>(),
+            EF::from(mu_tilde) + eps * sum,
+            "ĥ_1 should satisfy h(0) + h(1) = μ̃ + ε·μ",
         );
 
-        // TODO(commit 3 of PR #1605): Step 4, round 1.
-        // - Build ĥ_1 from `base.sumcheck_coefficients(...)` (plain piece) +
-        //   mask piece (live mask `s_1` weighted by `2^{k-1}`, plus
-        //   future-mask endpoints weighted by `2^{k-2}`).
-        // - Wire format: send (c0, c2, …, c_{ell_zk-1}); verifier derives c1
-        //   from `ĥ_1(0) + ĥ_1(1) = ε·μ + μ̃`.
-        // - Observe ĥ_1 coefficients (minus c1) on transcript.
-        // - Grind PoW; sample γ_1.
-        // - Fold base prover at γ_1; push s_1(γ_1) onto mask_evals_at_gamma;
-        //   decrement sum_future_endpoints by `s_2(0) + s_2(1)` if k ≥ 2.
-        // - Construct and return `(ZkSumcheckProver { … }, Point::new(vec![γ_1]))`.
-        unimplemented!("commit 3 of PR #1605: round 1 + ZkSumcheckProver construction")
+        // Wire format (decision block item 4): skip the linear coefficient
+        // `h1[1]`; verifier derives it from the affine constraint.
+        let mut h1_wire: Vec<EF> = Vec::with_capacity(h1_size - 1);
+        h1_wire.push(h1[0]);
+        for i in 2..h1_size {
+            h1_wire.push(h1[i]);
+        }
+
+        // Observe wire payload on the transcript and record in `zk_data`.
+        challenger.observe_algebra_slice(&h1_wire);
+        zk_data.round_coefficients.push(h1_wire);
+
+        // PoW grind, then sample `γ_1`.
+        if pow_bits > 0 {
+            zk_data.pow_witnesses.push(challenger.grind(pow_bits));
+        }
+        let gamma_1: EF = challenger.sample_algebra_element();
+
+        // Compute `s_1(γ_1)` via Horner's rule for the past-mask cache; this
+        // becomes `mask_evals_at_gamma[0]` so round 2's formula can read it.
+        let s1_at_gamma1: EF = masks[0]
+            .iter()
+            .rev()
+            .copied()
+            .fold(EF::ZERO, |acc, c| acc * gamma_1 + EF::from(c));
+        let mask_evals_at_gamma: Vec<EF> = vec![s1_at_gamma1];
+
+        // Fold base polynomial and weights at `γ_1`; update plain sum to
+        // `plain_h(γ_1)` via the standard extrapolation. The ZK side's
+        // tracking lives entirely in our struct; `base.sum` stays as the
+        // plain-piece sum, since round() will reuse the plain sumcheck
+        // arithmetic per round (multiplied by ε before being added to the
+        // mask piece).
+        weights.fix_prefix_var_mut(gamma_1);
+        let folded_poly = poly.fix_prefix_var(gamma_1);
+        let new_sum = extrapolate_01inf(plain_c0, sum - plain_c0, plain_c_inf, gamma_1);
+
+        let product_poly =
+            ProductPolynomial::<F, EF>::new_unpacked(VariableOrder::Prefix, folded_poly, weights);
+        debug_assert_eq!(product_poly.dot_product(), new_sum);
+        let base = SumcheckProver::new(product_poly, new_sum);
+
+        let prover = ZkSumcheckProver {
+            base,
+            encoding: encoding.clone(),
+            masks,
+            mask_oracles,
+            eps,
+            // After round 1's start-decrement: `Σ_{l > 1} = Σ_{l ≥ 2}`.
+            sum_future_endpoints: sum_future_endpoints_state,
+            mask_evals_at_gamma,
+            rounds_left: k - 1,
+        };
+
+        (prover, Point::new(vec![gamma_1]))
     }
 
     // TODO(follow-up commits): verifier counterpart (`verify_classic_unpacked`)
@@ -363,16 +487,15 @@ where
     /// bookkeeping.
     pub fn round<Challenger>(
         &mut self,
-        _sumcheck_data: &mut SumcheckData<F, EF>,
+        _zk_data: &mut ZkSumcheckData<F, EF>,
         _challenger: &mut Challenger,
-        _sum: &mut EF,
         _pow_bits: usize,
     ) -> EF
     where
         Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
-        // TODO(commit 3): per-round arithmetic + bookkeeping update.
-        unimplemented!("commit 3 of PR #1605: round() impl")
+        // TODO(follow-up commit): per-round arithmetic + bookkeeping update.
+        unimplemented!("follow-up commit: round() impl for rounds 2..=k")
     }
 
     /// Read-only access to the encoded mask oracles, for downstream
