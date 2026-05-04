@@ -28,13 +28,18 @@
 //!    and reuse `ZkSumcheckProver`. SVO is structurally compatible: only the
 //!    `(c0, c_inf)` computation of the plain piece differs.
 //!
-//! 3. **Transcript ordering** — observe each mask oracle in turn; observe
-//!    `μ̃`; sample `ε`; per round j: observe `ĥ_j` (`ℓ_zk - 1` field
-//!    elements; see #4); grind; sample `γ_j`. The protocol pins the relative
-//!    order of prover-sends and verifier-samples (Construction 6.3, with
-//!    HVZK forcing `μ̃` before `ε` and RBR forcing `ĥ_j` before `γ_j`); the
-//!    per-message observe granularity is a Fiat-Shamir realization choice
-//!    and we pick granular for debuggability.
+//! 3. **Transcript ordering** — for each mask oracle: MMCS-commit the
+//!    codeword and observe the commitment (binds the mask to ε); after all
+//!    k masks: observe `μ̃`; sample `ε`; per round j: observe `ĥ_j`
+//!    (`ℓ_zk - 1` field elements; see #4); grind; sample `γ_j`. The
+//!    protocol pins the relative order of prover-sends and verifier-samples
+//!    (Construction 6.3, with HVZK forcing `μ̃` before `ε` and RBR forcing
+//!    `ĥ_j` before `γ_j`); the per-message observe granularity is a
+//!    Fiat-Shamir realization choice and we pick granular for debuggability.
+//!    Mask oracles are bound by their MMCS commitment rather than by
+//!    absorbing codeword bytes — this is the same pattern as
+//!    [`p3_fri::HidingFriPcs`] and keeps `ZkEncoding::Codeword` opaque
+//!    (preserving the dependency isolation set up in #1601).
 //!
 //! 4. **Wire format — skip the linear coefficient.** Per round, send
 //!    `(c0, c2, c3, …, c_{ℓ_zk-1})`; verifier derives `c1` from the affine
@@ -98,8 +103,10 @@
 
 use alloc::vec::Vec;
 
-use p3_challenger::{FieldChallenger, GrindingChallenger};
+use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
+use p3_commit::Mmcs;
 use p3_field::{ExtensionField, Field};
+use p3_matrix::Matrix;
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 use p3_zk_codes::ZkEncoding;
@@ -129,11 +136,13 @@ pub struct ZkSumcheck;
 // `dead_code` allow lifts in commit 2/3 of PR #1605 once the prelude and
 // round logic actually read them.
 #[allow(dead_code)]
-pub struct ZkSumcheckProver<F, EF, Enc>
+pub struct ZkSumcheckProver<F, EF, Enc, M>
 where
     F: Field,
     EF: ExtensionField<F>,
     Enc: ZkEncoding<F>,
+    Enc::Codeword: Matrix<F>,
+    M: Mmcs<F>,
 {
     /// Plain sumcheck state (poly + claimed sum). Folded at each `γ_j`
     /// exactly like the non-ZK path — fold logic is unchanged.
@@ -149,11 +158,17 @@ where
     ///  in the reference paper:
     ///  Construction 6.3, step 1: "P samples s_1, …, s_k ∈ F^{<ℓ_zk}[X]"
     masks: Vec<Vec<F>>,
-    /// Encoded mask oracles. Kept in state and exposed via
-    /// [`Self::mask_oracles`] so downstream protocols (committed sumcheck
-    /// relation, §2.4 / §5 of the paper) can consume them.
-    /// These are the encoded codewords sent as oracles in round 1
-    mask_oracles: Vec<Enc::Codeword>,
+    /// MMCS commitment + prover data for each encoded mask codeword.
+    ///
+    /// - The `Commitment` is what gets observed on the challenger (binds
+    ///   the masks to ε; see decision block item 3).
+    /// - The `ProverData` is kept so downstream consumers (committed
+    ///   sumcheck relation, §2.4 / §5 of the paper) can produce opening
+    ///   proofs for queries to the mask oracles.
+    ///
+    /// Pattern matches [`p3_fri::HidingFriPcs`] — `Enc::Codeword` stays
+    /// opaque on the encoding trait; binding goes through the MMCS layer.
+    mask_oracles: Vec<(M::Commitment, M::ProverData<Enc::Codeword>)>,
     /// Combination challenge `ε` sampled after observing `μ̃`. Used in every
     /// subsequent round to scale the plain piece. In the paper:
     ///  ε ← F.
@@ -194,7 +209,7 @@ impl ZkSumcheck {
     /// - All assertions inherited from
     ///   [`super::single::SingleSumcheck::new_classic_unpacked`].
     #[allow(clippy::too_many_arguments)]
-    pub fn new_classic_unpacked<F, EF, Enc, Challenger, R>(
+    pub fn new_classic_unpacked<F, EF, Enc, M, Challenger, R>(
         poly: &Poly<F>,
         sumcheck_data: &mut SumcheckData<F, EF>,
         challenger: &mut Challenger,
@@ -202,13 +217,17 @@ impl ZkSumcheck {
         pow_bits: usize,
         statement: &EqStatement<EF>,
         encoding: &Enc,
+        mmcs: &M,
         rng: &mut R,
-    ) -> (ZkSumcheckProver<F, EF, Enc>, Point<EF>)
+    ) -> (ZkSumcheckProver<F, EF, Enc, M>, Point<EF>)
     where
         F: Field,
         EF: ExtensionField<F>,
         Enc: ZkEncoding<F>,
-        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        Enc::Codeword: Matrix<F>,
+        M: Mmcs<F>,
+        Challenger:
+            FieldChallenger<F> + GrindingChallenger<Witness = F> + CanObserve<M::Commitment>,
         R: Rng,
         StandardUniform: Distribution<F>,
     {
@@ -232,30 +251,23 @@ impl ZkSumcheck {
             .map(|_| (0..ell_zk).map(|_| rng.random()).collect())
             .collect();
 
-        // Encode each mask under `C_zk`. Encoding randomness is consumed by
-        // `Enc::encode` and not stored here — see the deferred-randomness
-        // discussion in `_search_log.md`; downstream composition will need
-        // `Enc: ZkEncodingWithRandomness` and a `mask_randomness` field.
-        let mask_oracles: Vec<Enc::Codeword> = masks
+        // ----- Step 1 (continued) — encode, MMCS-commit, observe -----
+        // For each mask: encode under C_zk, MMCS-commit the codeword, observe
+        // the commitment. The commitment is what binds the masks to the
+        // ε challenge sampled later (decision block item 3 — pattern matches
+        // `p3_fri::HidingFriPcs`). Encoding randomness is consumed inside
+        // `Enc::encode` and not stored here; downstream composition that
+        // needs `r'_j` will require bumping to `ZkEncodingWithRandomness`
+        // and adding a `mask_randomness` field (see `_search_log.md`).
+        let mask_oracles: Vec<(M::Commitment, M::ProverData<Enc::Codeword>)> = masks
             .iter()
-            .map(|mask| encoding.encode(mask, rng))
+            .map(|mask| {
+                let codeword = encoding.encode(mask, rng);
+                let (commit, prover_data) = mmcs.commit_matrix(codeword);
+                challenger.observe(commit.clone());
+                (commit, prover_data)
+            })
             .collect();
-
-        // ⚠ TODO(observation gap, pre-commit-3 design call):
-        // Construction 6.3 requires observing each mask oracle on the
-        // challenger here (decision block item 3 — masks committed before ε).
-        // `Enc::Codeword` is an opaque associated type with no
-        // `FieldChallenger`-compatible accessor on the `ZkEncoding` trait,
-        // so we cannot do this generically without one of:
-        //   - extending `ZkEncoding` with `fn observe<C>(&self, c, &mut C)`;
-        //   - adding a `Enc::Codeword: AsRef<[F]>` (or similar) bound here;
-        //   - committing each codeword via Merkle and observing the root,
-        //     mirroring how `single.rs` handles the witness oracle upstream.
-        // Until that decision is made, FIAT–SHAMIR BINDING TO THE MASKS IS
-        // BROKEN: a malicious prover could swap masks after seeing ε. This
-        // is captured by the (still-to-be-written) byte-identity snapshot
-        // test, which will fail when the observation lands — that is
-        // intended.
 
         // ----- Step 2 — compute μ̃ via the closed form -----
         // For separable masks `ŝ(b) = Σ_l ŝ_l(b_l)`,
@@ -335,11 +347,13 @@ impl ZkSumcheck {
     // and HVZK simulator (`simulate_classic_unpacked`).
 }
 
-impl<F, EF, Enc> ZkSumcheckProver<F, EF, Enc>
+impl<F, EF, Enc, M> ZkSumcheckProver<F, EF, Enc, M>
 where
     F: Field,
     EF: ExtensionField<F>,
     Enc: ZkEncoding<F>,
+    Enc::Codeword: Matrix<F>,
+    M: Mmcs<F>,
 {
     /// Runs one masked sumcheck round (rounds `2..=k`).
     ///
@@ -361,9 +375,14 @@ where
         unimplemented!("commit 3 of PR #1605: round() impl")
     }
 
-    /// Read-only access to the encoded mask oracles, for downstream protocols
-    /// (committed sumcheck relation; see §2.4 / §5 of eprint 2026/391).
-    pub fn mask_oracles(&self) -> &[Enc::Codeword] {
+    /// Read-only access to the encoded mask oracles, for downstream
+    /// protocols (committed sumcheck relation; see §2.4 / §5 of eprint
+    /// 2026/391).
+    ///
+    /// Returns `(MMCS commitment, prover data)` per mask. Downstream
+    /// callers can produce opening proofs by passing the prover data back
+    /// into the same MMCS instance.
+    pub fn mask_oracles(&self) -> &[(M::Commitment, M::ProverData<Enc::Codeword>)] {
         &self.mask_oracles
     }
 }
